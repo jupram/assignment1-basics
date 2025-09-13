@@ -53,39 +53,39 @@ def find_chunk_boundaries(
     return sorted(set(chunk_boundaries))
 
 def process_chunk(
-        input_path: str, start: int, end: int, special_token: bytes
-    ) -> dict[bytes, int]:
-        """
-        Process the specified chunk of the input file.
-        Splits the chunk by the decoded special token, tokenizes each part using regex,
-        counts tokens per part, merges them, and prints the results.
-        Returns the merged tokens count.
-        """
-        PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-        # Compile regex pattern
-        pattern = re.compile(PAT)
+    input_path: str, start: int, end: int, special_token: bytes) -> dict[bytes, int]:
+    """
+    Process the specified chunk of the input file.
+    Splits the chunk by the decoded special token, tokenizes each part using regex,
+    counts tokens per part, merges them, and prints the results.
+    Returns the merged tokens count.
+    """
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    # Compile regex pattern
+    pattern = re.compile(PAT)
 
-        # Read and process the specified chunk
-        with open(input_path, "rb") as f:
-            f.seek(start)
-            chunk = f.read(end - start).decode("utf-8", errors="ignore")
-            
-            # Split chunk using the special token (decoded)
-            parts = chunk.split(special_token.decode("utf-8"))
-            # Array to hold token counts for each part
-            tokens_count = [{} for _ in range(len(parts))]
-            
-            for i, part in enumerate(parts):
-                # Tokenize each part using regex
-                counter = {}
-                for match in pattern.finditer(part):
-                    token = match.group(0)
-                    counter[token] = counter.get(token, 0) + 1
-                tokens_count[i] = counter
-            
-            # Merge all token count dictionaries into one
-            merged_tokens_count = merge_token_counts(tokens_count)
-            return merged_tokens_count
+    # Read and process the specified chunk
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode("utf-8", errors="ignore")
+        
+        # Split chunk using the special token (decoded)
+        parts = chunk.split(special_token.decode("utf-8"))
+        # Array to hold token counts for each part
+        tokens_count = [{} for _ in range(len(parts))]
+        
+        for i, part in enumerate(parts):
+            # Tokenize each part using regex
+            counter = {}
+            for match in pattern.finditer(part):
+                token = match.group(0)
+                counter[token] = counter.get(token, 0) + 1
+            tokens_count[i] = counter
+        
+        # Merge all token count dictionaries into one
+        merged_tokens_count = merge_token_counts(tokens_count)
+        print(f"Processed chunk from {start} to {end} in process {mp.current_process().name}")
+        return merged_tokens_count
 
 def merge_token_counts(counts_list: list[dict[bytes, int]]) -> dict[bytes, int]:
     """
@@ -130,6 +130,7 @@ def run_train_bpe(
         tokens_count = pool.starmap(process_chunk, args)
 
     final_tokens_count = merge_token_counts(tokens_count)
+    print(f"Merged token counts from all chunks. Total unique tokens: {len(final_tokens_count)}")
     del tokens_count  # free memory
     
     # change the keys from bytes to tuple of bytes
@@ -178,7 +179,10 @@ def run_train_bpe(
 
         # Create new token by merging the most frequent pair
         new_token = most_frequent_pair[0] + most_frequent_pair[1]
+        # Add new token to vocabulary
+        print(f"Adding new token to vocab: {new_token} with size {len(new_token)}")
         vocab[vocab_size_current] = new_token
+    
         vocab_size_current += 1
 
         # Update token counts with the new merged token
@@ -222,13 +226,12 @@ def run_train_bpe(
     return vocab, merges
  
 def main():
-    input_path = r"../data/owt_valid.txt"
+    input_path = r"data/TinyStoriesV2-GPT4-train.txt"
     start = time.time()
     v, m =run_train_bpe(
         input_path,
-        vocab_size=500,
-        special_tokens=["<|endoftext|>"],
-        num_processes=8
+        vocab_size=10000,
+        special_tokens=["<|endoftext|>"]
     )
     end = time.time()
 
