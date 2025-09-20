@@ -694,6 +694,8 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
+    if not special_tokens:
+        special_tokens = ["<endoftext>"]
     tokenizer = Tokenizer(vocab, merges, special_tokens)
     return tokenizer
 
