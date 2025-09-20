@@ -13,6 +13,9 @@ We manage our environments with `uv` to ensure reproducibility, portability, and
 Install `uv` [here](https://github.com/astral-sh/uv) (recommended), or run `pip install uv`/`brew install uv`.
 We recommend reading a bit about managing projects in `uv` [here](https://docs.astral.sh/uv/guides/projects/#managing-dependencies) (you will not regret it!).
 
+#run this command on ubuntu 
+```sudo snap install astral-uv --classic```
+
 You can now run any code in the repo using
 ```sh
 uv run <python_file_path>
