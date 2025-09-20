@@ -4,6 +4,8 @@ import regex as re
 import multiprocessing as mp
 from multiprocessing import cpu_count
 import time
+from typing import IO, Any, BinaryIO, Iterable, Iterator
+
 
 
 def find_chunk_boundaries(
@@ -97,158 +99,178 @@ def merge_token_counts(counts_list: list[dict[bytes, int]]) -> dict[bytes, int]:
             merged_counts[token] = merged_counts.get(token, 0) + count
     return merged_counts
 
-def run_train_bpe(
-    input_path: str | os.PathLike,
-    vocab_size: int,
-    special_tokens: list[str],
-    **kwargs,
-) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    """
-    Train a BPE tokenizer from scratch on the given input file.
-    Returns the vocabulary and merges.
-    """
-     # check if input_path exists
-    if not os.path.exists(input_path):
-        raise FileNotFoundError(f"Input file {input_path} does not exist.")
+class Tokenizer:
+    """A BPE tokenizer that uses a provided vocabulary, merges, and special tokens."""
+    def __init__(
+        self,
+        vocab: dict[int, bytes],
+        merges: list[tuple[bytes, bytes]],
+        special_tokens: list[str] | None = None,
+    ):
+        self.vocab = vocab
+        self.inv_vocab = {t: id for id, t in self.vocab.items()}
+        #assign index to UNK token if not present
+        self.unk_id = max(self.vocab.keys()) + 1
+        vocab[self.unk_id] = b"<|unk|>"
+        self.merges = merges
+        self.special_tokens = special_tokens if special_tokens else []
+        PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+        self._pretokenize_regex = re.compile(PAT)
     
-    # first intialize empty dictionary for tokens_count for each chunk
-    tokens_count = []
-    # create a process thread for each chunk
-    num_processes = kwargs.get("num_processes", cpu_count())
-    special_tokens = [token.encode("utf-8") for token in special_tokens]
-    with open(input_path, "rb") as f:
-        chunk_boundaries = find_chunk_boundaries(f, num_processes, special_tokens[0])
-    print(f"Chunk boundaries: {chunk_boundaries}")
-
-    # Prepare arguments for each process
-    args = [
-        (input_path, start, end, special_tokens[0])
-        for start, end in zip(chunk_boundaries[:-1], chunk_boundaries[1:])
-    ]
-
-    with mp.Pool(processes=num_processes) as pool:
-        tokens_count = pool.starmap(process_chunk, args)
-
-    final_tokens_count = merge_token_counts(tokens_count)
-    print(f"Merged token counts from all chunks. Total unique tokens: {len(final_tokens_count)}")
-    del tokens_count  # free memory
-    
-    # change the keys from bytes to tuple of bytes
-    final_tokens_tuple_count = {tuple(bytes([b]) for b in token.encode("utf-8")): count for token, count in final_tokens_count.items()}
-    del final_tokens_count
-    # #print count for "the"
-    # the = tuple(bytes([b]) for b in b" the")
-    # print(f" Count for token {the}: {final_tokens_tuple_count.get(the, 0)}")
-
-    # iterate over the items of final_tokens_tuple_count and read every tuple([bytes]) and for every consecutive pair of bytes, 
-    # add to a new dictionary with count as value 
-    pair_counts = {}
-    for token_tuple, count in final_tokens_tuple_count.items():
-        for i in range(len(token_tuple) - 1):
-            pair = (token_tuple[i], token_tuple[i + 1])
-            pair_counts[pair] = pair_counts.get(pair, 0) + count
-    
-    #print(pair_counts[(b' ', b't')], pair_counts[(b't', b'h')], pair_counts[(b'h', b'e')])
-
-    # sort the pair_counts by value in descending order and key in descending order
-    if pair_counts:
-        most_frequent_pair = max(pair_counts.items(), key=lambda x: (x[1], x[0]))
-        most_frequent_pair = most_frequent_pair[0]
-    else:
-        most_frequent_pair = None
-
-    # Initialize vocabulary with specail tokens and single-character tokens
-    # add sepcial tokens to vocab
-    vocab = {}
-    vocab_size_current = 0
-    for token in special_tokens:
-        vocab[vocab_size_current] = token
-        vocab_size_current += 1
-    # add single character tokens from ascii range 0 to 255
-    for i in range(256):
-        vocab[vocab_size_current] = bytes([i])
-        vocab_size_current += 1
-    
-
-
-    merges = []
-    # Perform BPE merges until reaching the desired vocabulary size
-    while vocab_size_current < vocab_size and most_frequent_pair: 
-        # Get the most frequent pair
-        merges.append(most_frequent_pair)
-
-        # Create new token by merging the most frequent pair
-        new_token = most_frequent_pair[0] + most_frequent_pair[1]
-        # Add new token to vocabulary
-        print(f"Adding new token to vocab: {new_token} with size {len(new_token)}")
-        vocab[vocab_size_current] = new_token
-    
-        vocab_size_current += 1
-
-        # Update token counts with the new merged token
-        keys_changed = {}
+    @classmethod
+    def from_files(cls,
+        vocab_path: str,
+        merges_path: str,
+        special_tokens: list[str] | None = None,
+    ) -> "Tokenizer":
+        """Create a Tokenizer instance from vocab and merges files."""
+        # Load vocab
+        vocab = {}
+        #parse json file with int keys and string values
+        import json
+        with open(vocab_path, "r", encoding="utf-8") as f:
+            vocab_json = json.load(f)
+            for token_id, token in vocab_json.items():
+                vocab[int(token_id)] = token.encode("utf-8")
         
-        for token_tuple, count in final_tokens_tuple_count.items():
-            # Replace occurrences of the most frequent pair with the new token
-            new_token_tuple = []
-            i = 0
-            merged = False
-            while i < len(token_tuple):
-                if i < len(token_tuple) - 1 and (token_tuple[i], token_tuple[i + 1]) == most_frequent_pair:
-                    new_token_tuple.append(new_token)
-                    i += 2
-                    merged = True
-                else:
-                    new_token_tuple.append(token_tuple[i])
-                    i += 1
-            if merged:
-                keys_changed[token_tuple] = new_token_tuple
-                
-        # create a new dictionary with the items from final_tokens_tuple_count that were changed
-        for key in keys_changed.items():
-            count = final_tokens_tuple_count.pop(key[0])
-            final_tokens_tuple_count[tuple(key[1])] = final_tokens_tuple_count.get(tuple(key[1]), 0) + count
-        # Recalculate pair counts
-        pair_counts = {}
-        for token_tuple, count in final_tokens_tuple_count.items():
-            for i in range(len(token_tuple) - 1):
-                pair = (token_tuple[i], token_tuple[i + 1])
-                pair_counts[pair] = pair_counts.get(pair, 0) + count    
+        # Load merges
+        merges = []
+        with open(merges_path, "r", encoding="utf-8") as f:
+            #parse text json array of arrays with two string elements each
+            merge_json = json.load(f)
+            for m in merge_json:
+                token1, token2 = m
+                merges.append((token1.encode("utf-8"), token2.encode("utf-8")))
+        
+        return cls(vocab, merges, special_tokens)
 
-        # Sort pairs by frequency and lexicographically
-        if pair_counts:
-            most_frequent_pair = max(pair_counts.items(), key=lambda x: (x[1], x[0]))
-            most_frequent_pair = most_frequent_pair[0]
-        else:
-            most_frequent_pair = None
-        #print(f"Vocab size: {vocab_size_current}, Most common pair: {sorted_pairs[0] if sorted_pairs else 'N/A'}") 
+    def _do_single_merge(self, tokens: list[bytes]) -> list[bytes]:
+        """Perform a single BPE merge on the list of tokens."""
+        # Create a dictionary of pairs of adjacent tokens
+        pairs = {(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)}
 
-    return vocab, merges
- 
+        # Find the first mergeable pair according to the merges list
+        for merge in self.merges:
+            if merge in pairs:
+                # merge all occurrences of the pair
+                new_tokens = []
+                i = 0
+                while i < len(tokens):
+                    if i < len(tokens) - 1 and (tokens[i], tokens[i + 1]) == merge:
+                        new_tokens.append(tokens[i] + tokens[i + 1])
+                        i += 2  # Skip the next token as it's merged
+                    else:
+                        new_tokens.append(tokens[i])
+                        i += 1 # Move to the next token
+                return new_tokens
+
+        # If no merges were performed, return the original tokens
+        return tokens
+
+    def encode(self, text: str) -> list[int]:
+        """Encode the input text into a list of token IDs."""
+        # Pre-tokenize the input text
+        tokens = self._pretokenize(text)
+        token_ids = []
+        #print(tokens)
+        for t in tokens:
+            if t in [k.encode("utf-8") for k in self.special_tokens]:
+                token_id = self.inv_vocab.get(t, self.unk_id)
+                if token_id is not None:
+                    token_ids.append(token_id)
+                continue
+            else:
+                # turn token into list of bytes
+                subtokens = [bytes([b]) for b in t]
+                # Repeatedly apply merges until no more merges can be applied
+                while True:
+                    new_subtokens = self._do_single_merge(subtokens)
+                    if new_subtokens == subtokens:
+                        # Convert subtokens to token IDs and add to token_ids
+                        for subtoken in new_subtokens:
+                            token_id = self.inv_vocab.get(subtoken, self.unk_id)
+                            if token_id is not None:
+                                token_ids.append(token_id)
+                        break
+                    subtokens = new_subtokens
+        #print(token_ids)
+        return token_ids
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        """Encode an iterable of strings into an iterator of token IDs."""
+        for text in iterable:
+            yield from self.encode(text)
+    
+    def decode(self, token_ids: list[int]) -> str:
+        """Decode a list of token IDs back into a string."""
+        print(token_ids)
+        tokens = [self.vocab.get(tid) for tid in token_ids]
+        # if any token is b<|unk|>, replace it with U+FFFD
+        for i, token in enumerate(tokens):
+            if token == b"<|unk|>":
+                tokens[i] = b"\xef\xbf\xbd"  # U+FFFD in UTF-8
+        #turn list of bytes into list of strings
+        tokens = b"".join(tokens)
+        return tokens.decode("utf-8", errors='replace')
+
+    def _pretokenize(self, text: str) -> list[bytes]:
+        """Pre-tokenize the input text into a list of byte tokens."""
+        # create a regex pattern that matches either any of the special tokens or the pretokenize regex
+              
+        #special_tokens = "|".join(map(re.escape, self.special_tokens))
+        special_tokens = "|".join(sorted(map(re.escape, self.special_tokens), key=len, reverse=True))
+        tokens = []
+        parts = re.split(f"({special_tokens})", text)
+        print(parts)
+        for part in parts:
+            if part in self.special_tokens:
+                tokens.append(part.encode("utf-8"))
+            else:
+            # Tokenize each part using regex
+                for match in self._pretokenize_regex.finditer(part):
+                    token = match.group(0)
+                    tokens.append(token.encode("utf-8"))
+        return tokens
+
+
+def get_tokenizer(
+    vocab: dict[int, bytes],
+    merges: list[tuple[bytes, bytes]],
+    special_tokens: list[str] | None = None,
+) -> Any:
+    """Given a vocabulary, a list of merges, and a list of special tokens,
+    return a BPE tokenizer that uses the provided vocab, merges, and special tokens.
+
+    Args:
+        vocab (dict[int, bytes]): The tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
+            to bytes (token bytes)
+        merges (list[tuple[bytes, bytes]]): BPE merges. Each list item is a tuple of bytes (<token1>, <token2>),
+            representing that <token1> was merged with <token2>.
+            Merges are ordered by order of creation.
+        special_tokens (list[str] | None): A list of string special tokens for the tokenizer. These strings will never
+            be split into multiple tokens, and will always be kept as a single token.
+
+    Returns:
+        A BPE tokenizer that uses the provided vocab, merges, and special tokens.
+    """
+    raise NotImplementedError
+    
 def main():
-    input_path = r"data/TinyStoriesV2-GPT4-train.txt"
-    start = time.time()
-    v, m =run_train_bpe(
-        input_path,
-        vocab_size=10000,
-        special_tokens=["<|endoftext|>"]
+    tokenizer_vocab_path = "vocab_s.json"
+    tokenizer_merges_path = "merges_s.json"
+    special_tokens=["<|endoftext|>", "<|endoftext|><|endoftext|>"]
+
+    tokenizer = Tokenizer.from_files(
+        vocab_path=tokenizer_vocab_path,
+        merges_path=tokenizer_merges_path,
+        special_tokens=special_tokens
     )
-    end = time.time()
+    #german text with diactritics and emojis
+    text = "Hello, how <|endoftext|><|endoftext|> are you?<|endoftext|>"
 
-    print(f"Elapsed time: {end - start:.2f} seconds")
-    print(f"Final vocab size: {len(v)}")
-
-    #print the longest token in the vocab
-    longest_token = max(v.values(), key=len)
-    print(f"Longest token in vocab: {longest_token} with length {len(longest_token)}")
-
-    #serialize the vocab and merges to json and txt files respectively
-    import json
-    with open("vocab.json", "w", encoding="utf-8") as f:
-        json.dump({str(k): v.decode("utf-8", errors="ignore") for k, v in v.items()}, f, ensure_ascii=False, indent=4)
-    with open("merges.txt", "w", encoding="utf-8") as f:
-        for merge in m:
-            f.write(f"{merge[0].decode('utf-8', errors='ignore')} {merge[1].decode('utf-8', errors='ignore')}\n")
+    token_ids = tokenizer.encode(text)
+    decoded_text = tokenizer.decode(token_ids)
+    print(text == decoded_text )
 
 if __name__ == "__main__":
     main()
