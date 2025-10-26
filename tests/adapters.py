@@ -8,10 +8,36 @@ import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+import torch.nn as nn
 
 import regex as re
 import multiprocessing as mp
 from multiprocessing import cpu_count
+
+from einops import einsum, rearrange
+
+class LinearLayer(nn.Module):
+    def __init__(self, in_features, out_features, device=None, dtype=None):
+        super(LinearLayer, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.device = device
+        self.dtype = dtype
+        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype, device=device))
+        self.init_parameters()
+
+    def init_parameters(self):
+        bound = 3
+        variance = 2/(self.in_features + self.out_features) 
+        torch.nn.init.trunc_normal_(self.weight, mean=0.0, std=variance**0.5, a=-bound, b=bound)
+
+    def forward(self, input):
+        return einsum(input, self.weight,"... d_in, d_out d_in -> ... d_out", )
+
+    def extra_repr(self):
+        return 'in_features={}, out_features={}'.format(
+            self.in_features, self.out_features
+        )
 
 def run_linear(
     d_in: int,
@@ -32,8 +58,29 @@ def run_linear(
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
 
-    raise NotImplementedError
+    linear = LinearLayer(d_in, d_out)
+    linear.weight.data = weights
+    return linear(in_features)
 
+class EmbeddingLayer(nn.Module):
+    def __init__(self, num_embeddings, embedding_dim, device=None, dtype=None):
+        super(EmbeddingLayer, self).__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.weight = nn.Parameter(torch.empty(num_embeddings, embedding_dim, dtype=dtype, device=device))
+        self.init_parameters()
+
+    def init_parameters(self):
+        bound = 3
+        torch.nn.init.trunc_normal_(self.weight, mean=0.0, std=1, a=-bound, b=bound)
+
+    def forward(self, input):
+        return self.weight[input]
+
+    def extra_repr(self):
+        return 'num_embeddings={}, embedding_dim={}'.format(
+            self.num_embeddings, self.embedding_dim
+        )
 
 def run_embedding(
     vocab_size: int,
@@ -53,10 +100,10 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-
-    raise NotImplementedError
-
-
+    embedding = EmbeddingLayer(vocab_size, d_model)
+    embedding.weight.data = weights
+    return embedding(token_ids)
+ 
 def run_swiglu(
     d_model: int,
     d_ff: int,

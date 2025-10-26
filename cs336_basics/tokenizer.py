@@ -266,7 +266,7 @@ def main():
         special_tokens=special_tokens
     )
     #german text with diactritics and emojis
-    text = "Hello, how <|endoftext|><|endoftext|> are you?<|endoftext|>"
+    text = "Hello, how   <|endoftext|><|endoftext|> are you?<|endoftext|>"
 
     token_ids = tokenizer.encode(text)
     decoded_text = tokenizer.decode(token_ids)
