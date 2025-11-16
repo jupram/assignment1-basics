@@ -33,7 +33,7 @@ class LinearLayer(nn.Module):
         torch.nn.init.trunc_normal_(self.weight, mean=0.0, std=variance**0.5, a=-bound, b=bound)
 
     def forward(self, input):
-        return einsum(input, self.weight,"... d_in, d_out d_in -> ... d_out", )
+        return einsum(input, self.weight,"... d_in, d_out d_in -> ... d_out")
 
     def extra_repr(self):
         return 'in_features={}, out_features={}'.format(
@@ -179,6 +179,24 @@ def run_swiglu(
     swiglu.d_ff = d_ff  # Ensure d_ff is set correctly
     return swiglu(in_features)
 
+def scaled_dot_product_attention(
+    queries: torch.Tensor,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    mask: torch.Tensor = None,
+) -> torch.Tensor:
+    """
+    Compute the scaled dot-product attention.
+    """
+
+    scores = einsum(queries, keys,"... q d, ... k d -> ... q k") / torch.sqrt(torch.tensor(queries.size(-1), dtype=torch.float32))
+
+    if mask is not None:
+        scores = scores.masked_fill(mask == 0, float('-inf'))
+
+    attn = softmax(scores, dim=-1)
+    output = einsum(attn, values, "... q k, ... k d -> ... q d")
+    return output
 
 def run_scaled_dot_product_attention(
     Q: Float[Tensor, " ... queries d_k"],
@@ -198,8 +216,7 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
-
+    return scaled_dot_product_attention(Q, K, V, mask)
 
 def run_multihead_self_attention(
     d_model: int,
@@ -548,6 +565,8 @@ def run_rmsnorm(
     rms_norm.gains.data = weights
     return rms_norm(in_features)
 
+def silu(x):
+        return x * torch.sigmoid(x)
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
     """Given a tensor of inputs, return the output of applying SiLU
@@ -560,7 +579,7 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
+    return silu(in_features)
 
 
 def run_get_batch(
@@ -585,6 +604,12 @@ def run_get_batch(
     """
     raise NotImplementedError
 
+def softmax (x, dim):
+    # numerically stable softmax
+    x_max = torch.max(x, dim=dim, keepdim=True).values
+    x_exp = torch.exp(x - x_max)
+    x_exp_sum = torch.sum(x_exp, dim=dim, keepdim=True)
+    return x_exp / x_exp_sum
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
     """
@@ -599,8 +624,7 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
-
+    return softmax(in_features, dim=dim)
 
 def run_cross_entropy(
     inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]
