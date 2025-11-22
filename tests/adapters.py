@@ -218,6 +218,44 @@ def run_scaled_dot_product_attention(
     """
     return scaled_dot_product_attention(Q, K, V, mask)
 
+class MultiHeadAttention(nn.Module):
+    def __init__(self, dmodel: int, num_heads: int, device=None, dtype=None):
+        super(MultiHeadAttention, self).__init__()
+        assert dmodel % num_heads == 0, "dmodel must be divisible by num_heads"
+        self.dmodel = dmodel
+        self.num_heads = num_heads
+        self.d_k = dmodel // num_heads
+
+        self.linear_q = LinearLayer(dmodel, dmodel, device=device, dtype=dtype)
+        self.linear_k = LinearLayer(dmodel, dmodel, device=device, dtype=dtype)
+        self.linear_v = LinearLayer(dmodel, dmodel, device=device, dtype=dtype)
+        self.linear_out = LinearLayer(dmodel, dmodel, device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+
+        # Linear projections
+        Q = self.linear_q(x)  # (batch_size, seq_len, dmodel)
+        K = self.linear_k(x)     # (batch_size, seq_len, dmodel)
+        V = self.linear_v(x)   # (batch_size, seq_len, dmodel)
+        # Split into multiple heads
+        Q = rearrange(Q, '... seq (h d) -> ... h seq d', h=self.num_heads)
+        K = rearrange(K, '... seq (h d) -> ... h seq d', h=self.num_heads)
+        V = rearrange(V, '... seq (h d) -> ... h seq d', h=self.num_heads)
+        # Create mask if not provided (causal mask)
+        if mask is None:
+            mask = torch.tril(torch.ones(x.size(-2), x.size(-2), device=x.device)).unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, seq_len)
+
+        # Scaled dot-product attention
+        attn_output = scaled_dot_product_attention(Q, K, V, mask)  # (batch_size, num_heads, seq_len, d_k)
+
+        # Concatenate heads
+        attn_output = rearrange(attn_output, 'b h seq d -> b seq (h d)')
+
+        # Final linear layer
+        output = self.linear_out(attn_output)  # (batch_size, seq_len, dmodel)
+
+        return output
+
 def run_multihead_self_attention(
     d_model: int,
     num_heads: int,
@@ -249,8 +287,13 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
-
+    #print(q_proj_weight.shape, k_proj_weight.shape, v_proj_weight.shape, o_proj_weight.shape, in_features.shape)
+    mha = MultiHeadAttention(d_model, num_heads)
+    mha.linear_q.weight.data = q_proj_weight
+    mha.linear_k.weight.data = k_proj_weight
+    mha.linear_v.weight.data = v_proj_weight
+    mha.linear_out.weight.data = o_proj_weight
+    return mha(in_features)
 
 def run_multihead_self_attention_with_rope(
     d_model: int,

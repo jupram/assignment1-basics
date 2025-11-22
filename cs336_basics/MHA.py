@@ -5,6 +5,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import einsum
+from einops import rearrange, repeat
+from linear import LinearLayer
+
 
 def softmax(x, dim):
     # numerically stable softmax
@@ -32,6 +35,46 @@ def scaled_dot_product_attention(
     output = einsum("... q k, ... k d -> ... q d", attn, values)
     return output
 
+class MultiHeadAttention(nn.Module):
+    def __init__(self, dmodel: int, num_heads: int, device=None, dtype=None):
+        super(MultiHeadAttention, self).__init__()
+        assert dmodel % num_heads == 0, "dmodel must be divisible by num_heads"
+        self.dmodel = dmodel
+        self.num_heads = num_heads
+        self.d_k = dmodel // num_heads
+
+        self.linear_q = LinearLayer(dmodel, dmodel, device=device, dtype=dtype)
+        self.linear_k = LinearLayer(dmodel, dmodel, device=device, dtype=dtype)
+        self.linear_v = LinearLayer(dmodel, dmodel, device=device, dtype=dtype)
+        self.linear_out = LinearLayer(dmodel, dmodel, device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+
+        # Linear projections
+        Q = self.linear_q(x)  # (batch_size, seq_len, dmodel)
+        K = self.linear_k(x)     # (batch_size, seq_len, dmodel)
+        V = self.linear_v(x)   # (batch_size, seq_len, dmodel)
+        # Split into multiple heads
+        Q = rearrange(Q, '... seq (h d) -> ... h seq d', h=self.num_heads)
+        K = rearrange(K, '... seq (h d) -> ... h seq d', h=self.num_heads)
+        V = rearrange(V, '... seq (h d) -> ... h seq d', h=self.num_heads)
+        # Create mask if not provided (causal mask)
+        if mask is None:
+            mask = torch.tril(torch.ones(x.size(-2), x.size(-2), device=x.device)).unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, seq_len)
+
+        print(mask)
+        # Scaled dot-product attention
+        attn_output = scaled_dot_product_attention(Q, K, V, mask)  # (batch_size, num_heads, seq_len, d_k)
+
+        # Concatenate heads
+        attn_output = rearrange(attn_output, 'b h seq d -> b seq (h d)')
+
+        # Final linear layer
+        output = self.linear_out(attn_output)  # (batch_size, seq_len, dmodel)
+
+        return output
+
+
 def test_scaled_dot_product_attention():
     # simple test
     queries = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])  # shape: (1, 2, 2)
@@ -45,6 +88,16 @@ def test_scaled_dot_product_attention():
     assert output.shape == expected_shape, f"Output shape {output.shape} does not match expected shape {expected_shape}"
     print("Scaled dot-product attention test passed!")
 
+def test_multi_head_attention():
+    layer = MultiHeadAttention(dmodel=4, num_heads=2)
+    input = torch.randn(1, 3, 4)  # (batch=1, seq=3, dmodel=4)
+    output = layer(input)
+    print("Output:", output)
+    expected_shape = (1, 3, 4)
+    assert output.shape == expected_shape, f"Output shape {output.shape} does not match expected shape {expected_shape}"
+    print("Multi-Head Attention test passed!")
+
 if __name__ == "__main__":
     # simple test
-    test_scaled_dot_product_attention()
+    #test_scaled_dot_product_attention()
+    test_multi_head_attention()
