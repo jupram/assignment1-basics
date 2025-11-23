@@ -4,12 +4,17 @@ import torch.nn as nn
 from einops import einsum
 import math
 class SwiGLU(nn.Module):
-    def __init__(self, dmodel : int, device=None, dtype=None):
+    def __init__(self, dmodel : int, d_ff: int = None, device=None, dtype=None):
         super(SwiGLU, self).__init__()
         self.d_model = dmodel
-        # make sure d_ff is a multiple of 64
-        target = int(math.ceil((8/3) * dmodel))
-        self.d_ff = ((target + 63) // 64) * 64
+
+        if d_ff is None:
+            # make sure d_ff is a multiple of 64
+            target = int(math.ceil((8/3) * dmodel))
+            self.d_ff = ((target + 63) // 64) * 64
+        else:
+            self.d_ff = d_ff
+
         self.W1 = nn.Parameter(torch.empty(self.d_ff, self.d_model, dtype=dtype, device=device))
         self.W2 = nn.Parameter(torch.empty(self.d_model, self.d_ff, dtype=dtype, device=device))
         self.W3 = nn.Parameter(torch.empty(self.d_ff, self.d_model, dtype=dtype, device=device))

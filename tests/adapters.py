@@ -106,12 +106,17 @@ def run_embedding(
     return embedding(token_ids)
 
 class SwiGLU(nn.Module):
-    def __init__(self, dmodel : int, device=None, dtype=None):
+    def __init__(self, dmodel : int, d_ff: int = None, device=None, dtype=None):
         super(SwiGLU, self).__init__()
         self.d_model = dmodel
-        # make sure d_ff is a multiple of 64
-        target = int(math.ceil((8/3) * dmodel))
-        self.d_ff = ((target + 63) // 64) * 64
+
+        if d_ff is None:
+            # make sure d_ff is a multiple of 64
+            target = int(math.ceil((8/3) * dmodel))
+            self.d_ff = ((target + 63) // 64) * 64
+        else:
+            self.d_ff = d_ff
+
         self.W1 = nn.Parameter(torch.empty(self.d_ff, self.d_model, dtype=dtype, device=device))
         self.W2 = nn.Parameter(torch.empty(self.d_model, self.d_ff, dtype=dtype, device=device))
         self.W3 = nn.Parameter(torch.empty(self.d_ff, self.d_model, dtype=dtype, device=device))
@@ -140,7 +145,7 @@ class SwiGLU(nn.Module):
 
     def extra_repr(self):
         return 'dmodel={}, eps={}'.format(
-            self.dmodel, self.eps
+            self.d_model, self.eps
         )
 
 def run_swiglu(
@@ -295,6 +300,54 @@ def run_multihead_self_attention(
     mha.linear_out.weight.data = o_proj_weight
     return mha(in_features)
 
+class MultiHeadAttentionWithRoPE(nn.Module):
+    def __init__(self, dmodel: int, num_heads: int, max_seq_len: int, theta: int, device=None, dtype=None):
+        super(MultiHeadAttentionWithRoPE, self).__init__()
+        assert dmodel % num_heads == 0, "dmodel must be divisible by num_heads"
+        self.dmodel = dmodel
+        self.num_heads = num_heads
+        self.d_k = dmodel // num_heads
+
+        self.linear_q = LinearLayer(dmodel, dmodel, device=device, dtype=dtype)
+        self.linear_k = LinearLayer(dmodel, dmodel, device=device, dtype=dtype)
+        self.linear_v = LinearLayer(dmodel, dmodel, device=device, dtype=dtype)
+        self.linear_out = LinearLayer(dmodel, dmodel, device=device, dtype=dtype)
+        self.theta = theta
+
+        self.rope = RoPE(theta=self.theta, d_k=self.d_k, max_seq_len=max_seq_len, device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor = None, mask: torch.Tensor = None) -> torch.Tensor:
+
+        # Linear projections
+        Q = self.linear_q(x)  # (batch_size, seq_len, dmodel)
+        K = self.linear_k(x)     # (batch_size, seq_len, dmodel)
+        V = self.linear_v(x)   # (batch_size, seq_len, dmodel)
+        # Split into multiple heads
+        Q = rearrange(Q, '... seq (h d) -> ... h seq d', h=self.num_heads)
+        K = rearrange(K, '... seq (h d) -> ... h seq d', h=self.num_heads)
+        V = rearrange(V, '... seq (h d) -> ... h seq d', h=self.num_heads)
+
+        if token_positions is None:
+            seq_len = x.size(-2)
+            token_positions = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(x.size(0), -1)
+            
+        # Apply RoPE
+        Q = self.rope(Q, token_positions)
+        K = self.rope(K, token_positions)
+
+        # Create mask if not provided (causal mask)
+        if mask is None:
+            mask = torch.tril(torch.ones(x.size(-2), x.size(-2), device=x.device)).unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, seq_len)
+
+        # Scaled dot-product attention
+        attn_output = scaled_dot_product_attention(Q, K, V, mask)  # (batch_size, num_heads, seq_len, d_k)
+        # Concatenate heads
+        attn_output = rearrange(attn_output, 'b h seq d -> b seq (h d)')
+        # Final linear layer
+        output = self.linear_out(attn_output)  # (batch_size, seq_len, dmodel)
+
+        return output
+
 def run_multihead_self_attention_with_rope(
     d_model: int,
     num_heads: int,
@@ -332,7 +385,14 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+
+    mha = MultiHeadAttentionWithRoPE(d_model, num_heads, max_seq_len, theta)
+    mha.linear_q.weight.data = q_proj_weight
+    mha.linear_k.weight.data = k_proj_weight
+    mha.linear_v.weight.data = v_proj_weight
+    mha.linear_out.weight.data = o_proj_weight
+    
+    return mha(in_features, token_positions)
 
 class RoPE(nn.Module):
     def __init__(self, theta : float, d_k : int, max_seq_len : int, dtype=torch.float32, device=None,):
@@ -409,6 +469,27 @@ def run_rope(
     rope = RoPE(theta, d_k, max_seq_len, device=in_query_or_key.device)
     return rope(in_query_or_key, token_positions)
 
+class LMBlock(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, max_seq_len: int, theta: int, device=None, dtype=None):
+        super(LMBlock, self).__init__()
+        self.mha = MultiHeadAttentionWithRoPE(d_model, num_heads, max_seq_len, theta, device=device, dtype=dtype)
+        self.swiglu = SwiGLU(d_model, d_ff, device=device, dtype=dtype)
+        self.rms_norm1 = RMSNorm(d_model, device=device, dtype=dtype)
+        self.rms_norm2 = RMSNorm(d_model, device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor = None, mask: torch.Tensor = None) -> torch.Tensor:
+        x1 = self.rms_norm1(x)
+        # Multi-head attention with RoPE
+        attn_output = self.mha(x1, token_positions, mask)
+        x = x + attn_output  # Residual connection
+
+        # SwiGLU feed-forward network
+        x2 = self.rms_norm2(x)
+        ff_output = self.swiglu(x2)
+        x = x + ff_output  # Residual connection
+
+        return x
+
 def run_transformer_block(
     d_model: int,
     num_heads: int,
@@ -479,8 +560,37 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
 
+    lm_block = LMBlock(d_model, num_heads, d_ff, max_seq_len, theta)
+    lm_block.mha.linear_q.weight.data = weights['attn.q_proj.weight']
+    lm_block.mha.linear_k.weight.data = weights['attn.k_proj.weight']
+    lm_block.mha.linear_v.weight.data = weights['attn.v_proj.weight']
+    lm_block.mha.linear_out.weight.data = weights['attn.output_proj.weight']
+    lm_block.rms_norm1.gains.data = weights['ln1.weight']
+    lm_block.swiglu.W1.data = weights['ffn.w1.weight']
+    lm_block.swiglu.W2.data = weights['ffn.w2.weight']
+    lm_block.swiglu.W3.data = weights['ffn.w3.weight']
+    lm_block.rms_norm2.gains.data = weights['ln2.weight']
+    return lm_block(in_features)
+
+class FullLM(nn.Module):
+    def __init__(self, vocab_size: int, d_model: int, num_heads: int, d_ff: int, num_layers: int, max_seq_len: int, theta: int, device=None, dtype=None):
+        super(FullLM, self).__init__()
+        self.embedding = EmbeddingLayer(vocab_size, d_model, device=device, dtype=dtype)
+        self.layers = nn.ModuleList([
+            LMBlock(d_model, num_heads, d_ff, max_seq_len, theta, device=device, dtype=dtype)
+            for _ in range(num_layers)
+        ])
+        self.rms_norm = RMSNorm(d_model, device=device, dtype=dtype)
+        self.output_linear = LinearLayer(d_model, vocab_size, device=device, dtype=dtype)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        x = self.embedding(input_ids)  # (batch_size, seq_len, d_model)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.rms_norm(x)
+        logits = self.output_linear(x)  # (batch_size, seq_len, vocab_size)
+        return logits
 
 def run_transformer_lm(
     vocab_size: int,
@@ -506,7 +616,7 @@ def run_transformer_lm(
         num_heads (int): Number of heads to use in multi-headed attention. `d_model` must be
             evenly divisible by `num_heads`.
         d_ff (int): Dimensionality of the feed-forward inner layer (section 3.3).
-        rope_theta (float): The RoPE $\Theta$ parameter.
+        rope_theta (float): The RoPE $\\Theta$ parameter.
         weights (dict[str, Tensor]):
             State dict of our reference implementation. {num_layers} refers to an
             integer between `0` and `num_layers - 1` (the layer index).
@@ -561,7 +671,21 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    lm = FullLM(vocab_size, d_model, num_heads, d_ff, num_layers, context_length, rope_theta)
+    lm.embedding.weight.data = weights['token_embeddings.weight']
+    for layer_idx in range(num_layers):
+        lm.layers[layer_idx].mha.linear_q.weight.data = weights[f'layers.{layer_idx}.attn.q_proj.weight']
+        lm.layers[layer_idx].mha.linear_k.weight.data = weights[f'layers.{layer_idx}.attn.k_proj.weight']
+        lm.layers[layer_idx].mha.linear_v.weight.data = weights[f'layers.{layer_idx}.attn.v_proj.weight']
+        lm.layers[layer_idx].mha.linear_out.weight.data = weights[f'layers.{layer_idx}.attn.output_proj.weight']
+        lm.layers[layer_idx].rms_norm1.gains.data = weights[f'layers.{layer_idx}.ln1.weight']
+        lm.layers[layer_idx].swiglu.W1.data = weights[f'layers.{layer_idx}.ffn.w1.weight']
+        lm.layers[layer_idx].swiglu.W2.data = weights[f'layers.{layer_idx}.ffn.w2.weight']
+        lm.layers[layer_idx].swiglu.W3.data = weights[f'layers.{layer_idx}.ffn.w3.weight']
+        lm.layers[layer_idx].rms_norm2.gains.data = weights[f'layers.{layer_idx}.ln2.weight']
+    lm.rms_norm.gains.data = weights['ln_final.weight']
+    lm.output_linear.weight.data = weights['lm_head.weight']
+    return lm(in_indices)
 
 class RMSNorm(nn.Module):
     def __init__(self, dmodel : int, eps : float = 1e-5 , device=None, dtype=None):
