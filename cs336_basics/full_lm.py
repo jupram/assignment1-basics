@@ -66,5 +66,22 @@ def test_lm_block():
     assert output.shape == (2, 10, d_model), "Output shape is incorrect"
     print("LMBlock test passed!")
 
+def test_full_lm():
+    vocab_size = 100
+    d_model = 16
+    num_heads = 4
+    d_ff = 64
+    num_layers = 32
+    max_seq_len = 20
+    theta = 10000
+
+    model = FullLM(vocab_size, d_model, num_heads, d_ff, num_layers, max_seq_len, theta)
+    input_ids = torch.randint(0, vocab_size, (2, 15))  # (batch=2, seq=15)
+    logits = model(input_ids)
+    print("Logits:", logits)
+    assert logits.shape == (2, 15, vocab_size), "Logits shape is incorrect"
+    print("FullLM test passed!")
+
 if __name__ == "__main__":
     test_lm_block()
+    test_full_lm()

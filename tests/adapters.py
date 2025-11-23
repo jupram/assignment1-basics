@@ -330,7 +330,8 @@ class MultiHeadAttentionWithRoPE(nn.Module):
         if token_positions is None:
             seq_len = x.size(-2)
             token_positions = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(x.size(0), -1)
-            
+        # Add head axis so RoPE broadcast works with (batch, heads, seq, d_k)
+        token_positions = token_positions.unsqueeze(1)
         # Apply RoPE
         Q = self.rope(Q, token_positions)
         K = self.rope(K, token_positions)
